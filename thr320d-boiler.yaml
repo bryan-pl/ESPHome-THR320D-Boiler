@@ -1,0 +1,266 @@
+substitutions:
+  name: "boiler"
+  friendly_name: "THR320D_Boiler"
+  project_name: "Termostaty"
+  project_version: "1.2"
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  on_boot:
+    - priority: 90
+      then:
+      # supply the external sensor with 3v power by pulling this GPIO high
+      - switch.turn_on: sensor_power
+      # make sure the relay is in a known state at startup
+      - switch.turn_off: main_relay
+      # Default to running the boiler in Eco mode
+      - climate.control:
+          id: boiler_climate
+          preset: "Eco"
+
+esp32:
+  board: nodemcu-32s
+
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret thr320d_apikey
+
+ota:
+  password: !secret thr320d_otapassword
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "THR320D-Boiler Fallback AP"
+    password: !secret thr32d_fallbackAP_password
+
+captive_portal:
+
+display:
+# usage of built-in 2row display
+# upper row  - actual temperature and display of celcius sign
+# lower row -  target tenperature and disabled humidity sign
+  platform: tm1621
+  id: tm1621_display
+  cs_pin: GPIO17
+  data_pin: GPIO5
+  read_pin: GPIO23
+  write_pin: GPIO18
+  lambda: |-
+    it.printf(0, "%.1f", id(temp).state);  
+    it.display_celsius(true);
+    it.printf(1, "%.1f", id(boiler_climate).target_temperature);
+    it.display_humidity(false);  
+
+
+binary_sensor:
+  # single main button that also puts device into flash mode when held on boot
+  # For someone in the ceiling, this can be used to turn the climate control
+  # into OFF or HEAT modes. It does NOT directly control the relay.
+  - platform: gpio
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      inverted: True
+    id: button0
+    filters:
+      - delayed_on_off: 50ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return id(boiler_climate).mode != CLIMATE_MODE_OFF;
+            then:
+              - logger.log: "Boiler OFF"
+              - climate.control:
+                  id: boiler_climate
+                  mode: "OFF"
+            else:
+              - logger.log: "Bolier ON"
+              - climate.control:
+                  id: boiler_climate
+                  mode: "HEAT"
+
+switch:
+  - platform: template
+    id: main_relay
+    turn_on_action:
+      - button.press: main_relay_on
+      - light.turn_on: onoff_led
+    turn_off_action:
+      - button.press: main_relay_off
+      - light.turn_off: onoff_led
+    assumed_state: True
+    optimistic: True
+    restore_mode: restore_default_off
+  
+  - platform: gpio    #GPIO27 providing power to the DS18B20
+    pin: GPIO27
+    id: sensor_power
+    restore_mode: ALWAYS_ON
+
+
+output:
+  # Ideally, these two relay GPIOs should be interlocked to prevent
+  # simultaneous operation. ESPhome currently does not support
+  # interlocks at an output: level, or even at a button: level
+  # BE CAREFUL!
+  - platform: gpio
+    id: main_relay_on_output
+    pin:
+      number: GPIO19
+      inverted: true
+
+  - platform: gpio
+    id: main_relay_off_output
+    pin:
+      number: GPIO22
+      inverted: true
+
+  - platform: ledc
+    id: red_led_output
+    pin:
+      number: GPIO16
+      inverted: true
+
+  - platform: ledc
+    id: green_led_output
+    pin:
+      number: GPIO13
+      inverted: true
+
+  
+button:
+  - platform: output
+    id: main_relay_on
+    output: main_relay_on_output
+    duration: 100ms
+
+  - platform: output
+    id: main_relay_off
+    output: main_relay_off_output
+    duration: 100ms
+
+# The middle (blue) LED is used as wifi status indicator.
+status_led:
+  pin:
+    number: GPIO15
+    inverted: true
+
+light:
+  # Leftmost (red) LED that's used to indicate the relay being on/off
+  - platform: binary
+    id: onoff_led
+    output: red_led_output
+    internal: true
+
+  # Rightmost (green) LED used to indicate climate control being active
+  - platform: binary
+    id: auto_led
+    output: green_led_output
+    internal: true
+
+sensor:
+  # boiler temperature sensor - Dallas must be mounted in specific place of boiler to provide reliable measurements
+  - platform: dallas
+    address: 0x0b01211415544428
+    id: temp
+    name: "Temperature"
+    on_value_range:
+      - below: 10.0
+        then:
+          - logger.log: "Boiler temp too low!"
+          - climate.control:
+              id: boiler_climate
+              mode: "OFF"
+      - above: 70.0
+        then:
+          - logger.log: "Boiler temp too high!"
+          - climate.control:
+              id: boiler_climate
+              mode: "OFF"
+
+  - platform: internal_temperature
+    name: "Internal Temperature"
+
+  # Heater virtual power sensor
+  # adjust 4500 to the nominal power fo the heater
+  - platform: template
+    name: "Boiler Moc"
+    id: boiler_current_power
+    accuracy_decimals: 0
+    unit_of_measurement: "W"
+    device_class: POWER
+    lambda: |-
+     if (id(main_relay).state) {
+        return 4500.0;
+      } else {
+        return 0.0;
+      }
+
+climate:
+# thermostat component to steer the heater
+  - platform: thermostat
+    id: boiler_climate
+    name: "Climate"
+    sensor: temp
+    visual:
+      min_temperature: 10C
+      max_temperature: 70C
+      temperature_step:
+        target_temperature: 1
+        current_temperature: 0.1
+    default_preset: Home
+    preset:
+      - name: Home           #nominal boiler set temp
+        default_target_temperature_low: 55C
+        mode: heat
+      - name: Boost         # boosted boiler set temp - used to consume excess PV production
+        default_target_temperature_low: 60C
+        mode: heat
+      - name: Eco           # eco heating - raerly used
+        default_target_temperature_low: 30C
+        mode: heat
+    min_heating_off_time: 0s
+    min_heating_run_time: 60s
+    min_idle_time: 30s
+    heat_action:
+      - switch.turn_on: main_relay
+    idle_action:
+      - switch.turn_off: main_relay
+    heat_deadband: 5 # low boundary for heting water activation
+    heat_overrun: 0.5 # high boundary for heating water deactivation
+    off_mode:
+      - switch.turn_off: main_relay
+    on_state:
+    - if:
+        condition:
+          lambda: |-
+            return id(boiler_climate).mode == CLIMATE_MODE_OFF;
+        then:
+          - logger.log: "Boiler OFF"
+          - light.turn_off: auto_led
+    - if:
+        condition:
+          lambda: |-
+            return id(boiler_climate).mode == CLIMATE_MODE_HEAT;
+        then:
+          - logger.log: "Boiler ON"
+          - light.turn_on: auto_led
+
+
+# temperature sensor platform pin and pooling interval 
+# update interval can be set longer i.e. 60s
+dallas:
+  pin: GPIO25
+  update_interval: 10s
